@@ -118,7 +118,11 @@ class Fedex implements IApiProvider
                 "requestedPackageLineItems" => [
                     [
                         "weight" => [
-                            "units" => "LB", "value" => UnitConversions::grams_to_pounds($shippingQuote->orderWeightWithPackagingInGrams)
+                            //FedEx rejects weight values with more than 2 decimal
+                            //places as PACKAGE.WEIGHT.INVALID. grams_to_pounds()
+                            //returns 4 decimal places, so it must be rounded before
+                            //being sent.
+                            "units" => "LB", "value" => round(UnitConversions::grams_to_pounds($shippingQuote->orderWeightWithPackagingInGrams), 2)
                         ]
                     ]
                 ]
