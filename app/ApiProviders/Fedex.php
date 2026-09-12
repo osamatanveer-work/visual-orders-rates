@@ -119,14 +119,63 @@ class Fedex implements IApiProvider
             ]
         ];
 
-        //ask for delivery commitments. without this flag the reply carries no
-        //commit/operationalDetail transit data at all, which is why the old
-        //code had nothing to work with and fell back to a hardcoded window.
+        //--------------------------------------------------------------------
+        // Delivery commitments (transit times)
+        //
+        // FIX: the previous code set
+        //     $body['requestedShipment']['returnTransitTimes'] = true;
+        // That flag belongs to FedEx's LEGACY SOAP Web Services API. It is NOT
+        // a valid field on the REST Rate API (/rate/v1/rates/quotes) we call
+        // here, so FedEx rejected the ENTIRE request with
+        //   HTTP 400  "BAD.REQUEST.ERROR ... Missing or duplicate"
+        // which dropped FedEx out of every quote at checkout.
+        //
+        // The REST Rate & Transit Times API instead returns the commit /
+        // transitDays block automatically for eligible services once a planned
+        // ship date (shipDateStamp) is supplied. normalizeRates() ->
+        // applyDeliveryEstimate() already reads that block, so all we need to
+        // do is send a valid ship date.
+        //
+        // We build the transit-enabled request as a SEPARATE body and try it
+        // first; if FedEx ever rejects it we fall back to the plain request so
+        // we always return prices, and at worst lose only the ETA - never the
+        // rate. (Same defensive pattern used for the UPS transit call.)
+        //--------------------------------------------------------------------
         if (config('shipping.request_transit_times', true)) {
-            $body['requestedShipment']['returnTransitTimes'] = true;
+            $transitBody = $body;
+            $transitBody['requestedShipment']['shipDateStamp'] = now()->format('Y-m-d');
+
+            try {
+                $response = $this->postRateRequest($token, $transitBody);
+                $response->throw();
+
+                return [$response->json()];
+            } catch (\Throwable $e) {
+                ApiRequestNote::newNote('error', 'FedEx transit-time request failed, falling back to plain rate', [
+                    'error' => $e->getMessage()
+                ]);
+            }
         }
 
-        $response = Http::withUserAgent(env('HTTP_USERAGENT', 'GuzzleHttp/7'))
+        $response = $this->postRateRequest($token, $body);
+        $response->throw();
+
+        return [$response->json()];
+    }
+
+    /**
+     * postRateRequest
+     * Sends a rate request body to the FedEx REST Rate API and returns the
+     * raw HTTP response (not yet ->throw()n, so the caller can decide).
+     *
+     * @param string $token
+     * @param array  $body
+     *
+     * @return \Illuminate\Http\Client\Response
+     */
+    protected function postRateRequest(string $token, array $body)
+    {
+        return Http::withUserAgent(env('HTTP_USERAGENT', 'GuzzleHttp/7'))
             ->timeout(env('HTTP_TIMEOUT', 5))
             ->connectTimeout(env('HTTP_CONNECT', 2))
             ->withHeaders([
@@ -134,10 +183,6 @@ class Fedex implements IApiProvider
             ])
             ->withToken($token)
             ->post(env('FEDEX_LIVE_URL') . '/rate/v1/rates/quotes', $body);
-
-        $response->throw();
-
-        return [$response->json()];
     }
 
     /**
@@ -195,10 +240,13 @@ class Fedex implements IApiProvider
      */
     protected function applyDeliveryEstimate(ShippingQuoteService $service, array $reply): void
     {
-        //1. a committed delivery timestamp, most precise
+        //1. a committed delivery timestamp, most precise.
+        //   commit.dateDetail.dayFormat is the REST field; the others are
+        //   fallbacks seen on some services / API versions.
         $committed = $reply['commit']['dateDetail']['dayFormat']
-            ?? $reply['operationalDetail']['deliveryDate']
             ?? $reply['commit']['derivedDeliveryDate']
+            ?? $reply['operationalDetail']['deliveryDate']
+            ?? $reply['operationalDetail']['deliveryDay']
             ?? null;
 
         $date = TransitEstimate::fromIso($committed);
@@ -211,9 +259,10 @@ class Fedex implements IApiProvider
             return;
         }
 
-        //2. a transit-day count, e.g. "TWO_DAYS"
-        $transitEnum = $reply['operationalDetail']['transitTime']
-            ?? $reply['commit']['transitDays']['description']
+        //2. a transit-day count, e.g. "TWO_DAYS" or a numeric transit count.
+        $transitEnum = $reply['commit']['transitDays']['description']
+            ?? $reply['commit']['transitDays']['minimumTransitTime']
+            ?? $reply['operationalDetail']['transitTime']
             ?? null;
 
         $days = TransitEstimate::fedexTransitDays($transitEnum);
