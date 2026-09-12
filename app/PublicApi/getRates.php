@@ -97,6 +97,15 @@ class getRates
             $shippingQuote->orderWeightWithPackagingInGrams += $boxGrams;
         }
 
+        //a zero (or negative) weight means every carrier will reject the
+        //rate request outright (e.g. UPS: "Packages must weigh more than
+        //zero pounds"). fail fast here with a clear reason instead of
+        //letting each carrier reject it deep in its own API call - this is
+        //almost always a product in the store with no weight configured.
+        if ($shippingQuote->orderWeightWithPackagingInGrams <= 0) {
+            throw new Exception('Order weight is zero - check that product weights are set in Shopify');
+        }
+
         //save our shipping quote
         $shippingQuote->save();
 
