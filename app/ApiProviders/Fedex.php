@@ -8,6 +8,7 @@ use App\Models\ShippingQuoteHeader;
 use App\Models\ShippingQuoteService;
 use App\Support\TransitEstimate;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -60,9 +61,14 @@ class Fedex implements IApiProvider
                 'scope' => '', // Adjust the scope if needed
             ]);
 
-        //if the response from fedex was not successful then log an error and return
-        //an empty string
-        $response->throw();
+        //if the response from fedex was not successful log the actual error
+        //FedEx sent back (status + body), not just the exception message
+        try {
+            $response->throw();
+        } catch (\Throwable $e) {
+            $this->logFedexError('FedEx OAuth token request failed', $e);
+            throw $e;
+        }
 
         return $response->json('access_token', '');
     }
@@ -151,16 +157,44 @@ class Fedex implements IApiProvider
 
                 return [$response->json()];
             } catch (\Throwable $e) {
-                ApiRequestNote::newNote('error', 'FedEx transit-time request failed, falling back to plain rate', [
-                    'error' => $e->getMessage()
-                ]);
+                $this->logFedexError('FedEx transit-time rate request failed, falling back to plain rate', $e);
             }
         }
 
         $response = $this->postRateRequest($token, $body);
-        $response->throw();
+
+        try {
+            $response->throw();
+        } catch (\Throwable $e) {
+            $this->logFedexError('FedEx rate request failed', $e);
+            throw $e;
+        }
 
         return [$response->json()];
+    }
+
+    /**
+     * logFedexError
+     * Logs a FedEx API failure with the actual status code and response body
+     * FedEx sent back, not just the exception message - that detail is what
+     * actually explains WHY a request failed (e.g. an invalid field, expired
+     * token, bad account number) instead of just that it did.
+     *
+     * @param string $message
+     * @param \Throwable $e
+     *
+     * @return void
+     */
+    protected function logFedexError(string $message, \Throwable $e): void
+    {
+        $context = ['error' => $e->getMessage()];
+
+        if ($e instanceof RequestException) {
+            $context['status'] = $e->response->status();
+            $context['body'] = $e->response->json() ?? $e->response->body();
+        }
+
+        ApiRequestNote::newNote('error', $message, $context);
     }
 
     /**
@@ -199,7 +233,8 @@ class Fedex implements IApiProvider
         $quotedServices = [];
         foreach ($responses as $data) {
             if (!isset($data['output']['rateReplyDetails'])) {
-                throw new \Exception('Fedex API Error x-2');
+                ApiRequestNote::newNote('error', 'FedEx response missing rateReplyDetails', $data);
+                throw new \Exception('Fedex API Error: response missing rateReplyDetails');
             }
 
             foreach ($data['output']['rateReplyDetails'] as $reply) {
