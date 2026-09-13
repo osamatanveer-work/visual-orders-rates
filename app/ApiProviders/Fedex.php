@@ -8,6 +8,7 @@ use App\Models\ShippingQuoteHeader;
 use App\Models\ShippingQuoteService;
 use App\Support\TransitEstimate;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Http\Client\Pool;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\Cache;
@@ -95,25 +96,16 @@ class Fedex implements IApiProvider
     }
 
     /**
-     * getRates
-     * This method is responsible for calling the carrier api
-     * and returning the responses as an array (of decoded responses)
+     * buildRateBody
+     * Builds the plain (no transit-time request) FedEx rate request body.
      *
      * @param ShippingQuoteHeader $shippingQuote
      *
      * @return array
      */
-    public function getRates(ShippingQuoteHeader $shippingQuote): array
+    protected function buildRateBody(ShippingQuoteHeader $shippingQuote): array
     {
-        $token = $this->getAccessToken();
-
-        //if the access token failed
-        if (strlen($token) === 0) {
-            Log::error('Fedex API Access Token Error', [$token]);
-            throw new \Exception('Fedex API Access Token Error');
-        }
-
-        $body = [
+        return [
             "accountNumber" => [
                 "value" => env('FEDEX_ACCOUNT_NO')
             ],
@@ -149,46 +141,121 @@ class Fedex implements IApiProvider
                 ]
             ]
         ];
+    }
 
-        //--------------------------------------------------------------------
-        // Delivery commitments (transit times)
-        //
-        // returnTransitTimes IS a valid REST field (confirmed against FedEx's
-        // own OpenAPI schema for this endpoint), but it lives under a
-        // TOP-LEVEL "rateRequestControlParameters" object - a sibling of
-        // requestedShipment, not a field inside it. Every previous attempt
-        // (including the one that got a 400 and the one that silently did
-        // nothing) put it in the wrong place. shipDateStamp stays inside
-        // requestedShipment as before.
-        //
-        // We build the transit-enabled request as a SEPARATE body and try it
-        // first; if FedEx ever rejects it we fall back to the plain request so
-        // we always return prices, and at worst lose only the ETA - never the
-        // rate. (Same defensive pattern used for the UPS transit call.)
-        //--------------------------------------------------------------------
-        if (config('shipping.request_transit_times', true)) {
-            $transitBody = $body;
-            $transitBody['requestedShipment']['shipDateStamp'] = now()->format('Y-m-d');
-            $transitBody['rateRequestControlParameters'] = [
-                'returnTransitTimes' => true
-            ];
+    /**
+     * buildTransitBody
+     * Builds the transit-enabled FedEx rate request body.
+     *
+     * returnTransitTimes IS a valid REST field (confirmed against FedEx's
+     * own OpenAPI schema for this endpoint), but it lives under a TOP-LEVEL
+     * "rateRequestControlParameters" object - a sibling of requestedShipment,
+     * not a field inside it. Every previous attempt (including the one that
+     * got a 400 and the one that silently did nothing) put it in the wrong
+     * place.
+     *
+     * @param ShippingQuoteHeader $shippingQuote
+     *
+     * @return array
+     */
+    protected function buildTransitBody(ShippingQuoteHeader $shippingQuote): array
+    {
+        $body = $this->buildRateBody($shippingQuote);
+        $body['requestedShipment']['shipDateStamp'] = now()->format('Y-m-d');
+        $body['rateRequestControlParameters'] = [
+            'returnTransitTimes' => true
+        ];
 
-            try {
-                $response = $this->postRateRequest($token, $transitBody);
-                $response->throw();
+        return $body;
+    }
 
-                return [$response->json()];
-            } catch (\Throwable $e) {
-                $this->logFedexError('FedEx transit-time rate request failed, falling back to plain rate', $e);
-            }
+    /**
+     * buildRateRequests
+     * Adds FedEx's best-effort (transit-enabled) rate request to the given
+     * HTTP connection pool so it runs genuinely concurrently with every
+     * other carrier's requests via curl_multi, instead of blocking the
+     * whole process in turn - Laravel's Http client is synchronous, so
+     * wrapping it in an Amp fiber alone does NOT make it non-blocking.
+     *
+     * @param Pool $pool
+     * @param ShippingQuoteHeader $shippingQuote
+     *
+     * @return array
+     */
+    public function buildRateRequests(Pool $pool, ShippingQuoteHeader $shippingQuote): array
+    {
+        $token = $this->getAccessToken();
+
+        if (strlen($token) === 0) {
+            Log::error('Fedex API Access Token Error', [$token]);
+            throw new \Exception('Fedex API Access Token Error');
         }
 
-        $response = $this->postRateRequest($token, $body);
+        $useTransitBody = config('shipping.request_transit_times', true);
+        $body = $useTransitBody ? $this->buildTransitBody($shippingQuote) : $this->buildRateBody($shippingQuote);
+
+        return [
+            'fedex' => $pool->as('fedex')
+                ->withUserAgent(env('HTTP_USERAGENT', 'GuzzleHttp/7'))
+                ->timeout(env('HTTP_TIMEOUT', 5))
+                ->connectTimeout(env('HTTP_CONNECT', 2))
+                ->withHeaders([
+                    'rs-request-id' => uniqid()
+                ])
+                ->withToken($token)
+                ->post(env('FEDEX_LIVE_URL') . '/rate/v1/rates/quotes', $body)
+        ];
+    }
+
+    /**
+     * parseRatesResponses
+     * Validates the pooled response and returns it in the same shape the
+     * old getRates() used to return. Throws if FedEx rejected the request,
+     * signalling the caller to try buildFallbackRates() instead.
+     *
+     * @param array $responses keyed the same way buildRateRequests() named them
+     *
+     * @return array
+     */
+    public function parseRatesResponses(array $responses): array
+    {
+        $response = $responses['fedex'];
 
         try {
             $response->throw();
         } catch (\Throwable $e) {
-            $this->logFedexError('FedEx rate request failed', $e);
+            $this->logFedexError('FedEx transit-time rate request failed, falling back to plain rate', $e);
+            throw $e;
+        }
+
+        return [$response->json()];
+    }
+
+    /**
+     * buildFallbackRates
+     * Blocking plain (no transit-time) rate request, used only when the
+     * pooled transit-enabled attempt failed. This is the rare path, so
+     * blocking here is an acceptable trade - resilience over speed.
+     *
+     * @param ShippingQuoteHeader $shippingQuote
+     *
+     * @return array
+     */
+    public function buildFallbackRates(ShippingQuoteHeader $shippingQuote): array
+    {
+        $token = $this->getAccessToken();
+
+        if (strlen($token) === 0) {
+            Log::error('Fedex API Access Token Error', [$token]);
+            throw new \Exception('Fedex API Access Token Error');
+        }
+
+        $response = $this->postRateRequest($token, $this->buildRateBody($shippingQuote));
+
+        try {
+            $response->throw();
+        } catch (\Throwable $e) {
+            $this->logFedexError('FedEx fallback rate request failed', $e);
             throw $e;
         }
 

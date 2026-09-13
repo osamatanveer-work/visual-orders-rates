@@ -9,12 +9,11 @@ use App\Models\ShippingQuoteHeader;
 use App\Models\ShippingQuoteService;
 use App\Support\TransitEstimate;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Http\Client\Pool;
 use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Dflydev\DotAccessData\Data;
-use function Amp\async;
-use Amp\Future;
 
 class UPS implements IApiProvider
 {
@@ -42,62 +41,127 @@ class UPS implements IApiProvider
     }
 
     /**
-     * getRates
-     * This method is responsible for calling the carrier api
-     * and returning the responses as an array (of decoded responses)
+     * buildRatePayload
+     * Builds the main (non-SurePost) UPS rate request payload.
      *
      * @param ShippingQuoteHeader $shippingQuote
      *
      * @return array
      */
-    public function getRates(ShippingQuoteHeader $shippingQuote): array
+    protected function buildRatePayload(ShippingQuoteHeader $shippingQuote): array
     {
-        $promises[] = async(function() use($shippingQuote) {
-            return $this->getRatesAlmostAll($shippingQuote);
-        });
-
-        if ((strtoupper($shippingQuote->shipTo->countryCode) == 'US') && ($shippingQuote->shipFrom->countryCode == 'US')) {
-            $lbsConversion = UnitConversions::grams_to_pounds($shippingQuote->orderWeightWithPackagingInGrams);
-            if ($lbsConversion <= 1) {
-                $promises[] = async(function() use($shippingQuote) {
-                    ApiRequestNote::newNote('debug','UPS eq or lt 1 lbs');
-
-                    return $this->getSurePost($shippingQuote,92);
-                });
-            } else {
-                if ($lbsConversion >= 1 && $lbsConversion <= 10) {
-                    $promises[] = async(function() use($shippingQuote) {
-                        ApiRequestNote::newNote('debug','UPS eq or gt 1 lbs and eq or lt 10 lbs');
-
-                        return $this->getSurePost($shippingQuote,93);
-                    });
-                }
-            }
-        }
-
-        //ApiRequestNote::newNote('debug','Starting UPS async');
-        $async = Future\awaitAll($promises);
-        ApiRequestNote::newNote('debug','UPS async',$async);
-
-        return $async[1];
+        return [
+            "RateRequest" => [
+                "Request" => [
+                    "TransactionReference" => [
+                        "CustomerContext" => "CustomerContext"
+                    ]
+                ],
+                "Shipment" => [
+                    "Shipper" => [
+                        "Name" => "ShipperName",
+                        "ShipperNumber" => env('UPS_SHIPPER_NUMBER'),
+                        "Address" => [
+                            "AddressLine" => [
+                                $shippingQuote->shipFrom->address1
+                            ],
+                            "City" => $shippingQuote->shipFrom->city,
+                            "StateProvinceCode" => $shippingQuote->shipFrom->stateOrProvince,
+                            "PostalCode" => $shippingQuote->shipFrom->postalCode,
+                            "CountryCode" => $shippingQuote->shipFrom->countryCode
+                        ]
+                    ],
+                    "ShipTo" => [
+                        "Name" => "ShipToName",
+                        "Address" => [
+                            "AddressLine" => [
+                                $shippingQuote->shipTo->address1
+                            ],
+                            "City" => $shippingQuote->shipTo->city,
+                            "StateProvinceCode" => $shippingQuote->shipTo->stateOrProvince,
+                            "PostalCode" => $shippingQuote->shipTo->postalCode,
+                            "CountryCode" => $shippingQuote->shipTo->countryCode
+                        ]
+                    ],
+                    "ShipFrom" => [
+                        "Name" => "ShipperName",
+                        "Address" => [
+                            "AddressLine" => [
+                                $shippingQuote->shipFrom->address1
+                            ],
+                            "City" => $shippingQuote->shipFrom->city,
+                            "StateProvinceCode" => $shippingQuote->shipFrom->stateOrProvince,
+                            "PostalCode" => $shippingQuote->shipFrom->postalCode,
+                            "CountryCode" => $shippingQuote->shipFrom->countryCode
+                        ]
+                    ],
+                    "PaymentDetails" => [
+                        "ShipmentCharge" => [
+                            [
+                                "Type" => "01",
+                                "BillShipper" => [
+                                    "AccountNumber" => env("UPS_SHIPPER_NUMBER")
+                                ]
+                            ]
+                        ]
+                    ],
+                    "ShipmentRatingOptions" => [
+                        "NegotiatedRatesIndicator" => "Y"
+                    ],
+                    "NumOfPieces" => "1",
+                    "Package" => [
+                        "PackagingType" => [
+                            "Code" => "02",
+                            "Description" => "Packaging"
+                        ],
+                        "PackageWeight" => [
+                            "UnitOfMeasurement" => [
+                                "Code" => "LBS",
+                                "Description" => "Pounds"
+                            ],
+                            "Weight" => number_format(UnitConversions::grams_to_pounds($shippingQuote->orderWeightWithPackagingInGrams), 1, '.', '')
+                        ]
+                    ]
+                ]
+            ]
+        ];
     }
 
     /**
-     * getSurePostUnder
-     * This method is responsible for calling the carrier api
-     * and returning the responses as an array (of decoded responses)
+     * buildTransitPayload
+     * /Shop returns prices only. /Shoptimeintransit returns the same prices
+     * plus a TimeInTransit block per service, but requires the
+     * DeliveryTimeInformation payload added here.
      *
      * @param ShippingQuoteHeader $shippingQuote
      *
      * @return array
      */
-    public function getSurePost(ShippingQuoteHeader $shippingQuote, int $code): array {
-        $token = $this->getAccessToken();
+    protected function buildTransitPayload(ShippingQuoteHeader $shippingQuote): array
+    {
+        $payload = $this->buildRatePayload($shippingQuote);
+        $payload['RateRequest']['Shipment']['DeliveryTimeInformation'] = [
+            //03 = non-document / package
+            "PackageBillType" => "03",
+            "Pickup" => [
+                "Date" => now()->format('Ymd'),
+                "Time" => now()->format('Hi')
+            ]
+        ];
 
-        if (strlen($token) === 0) {
-            throw new \Exception('No UPS token');
-        }
+        return $payload;
+    }
 
+    /**
+     * buildSurePostPayload
+     *
+     * @param ShippingQuoteHeader $shippingQuote
+     * @param int $code
+     *
+     * @return array
+     */
+    protected function buildSurePostPayload(ShippingQuoteHeader $shippingQuote, int $code): array
+    {
         if ($code == 92) {
             //convert to ounces
             $unitCode = 'OZS';
@@ -110,7 +174,7 @@ class UPS implements IApiProvider
             $weight = UnitConversions::grams_to_pounds($shippingQuote->orderWeightWithPackagingInGrams);
         }
 
-        $payload = [
+        return [
             "RateRequest" => [
                 "Request" => [
                     "TransactionReference" => [
@@ -195,31 +259,52 @@ class UPS implements IApiProvider
                 ]
             ]
         ];
-
-        $response = Http::withUserAgent(env('HTTP_USERAGENT', 'GuzzleHttp/7'))
-            ->timeout(env('HTTP_TIMEOUT', 5))
-            ->connectTimeout(env('HTTP_CONNECT', 2))
-            ->withHeaders([
-                'rs-request-id' => uniqid()
-            ])
-            ->withToken($token)
-            ->post(env('UPS_LIVE_URL') . '/api/rating/v2403/Rate', $payload);
-
-        $response->throw();
-
-        return $response->json();
     }
 
     /**
-     * getRatesAlmostAll
-     * This method is responsible for calling the carrier api
-     * and returning the responses as an array (of decoded responses)
+     * getSurePostCode
+     * Returns the SurePost service code applicable for this shipment's
+     * weight, or null if SurePost does not apply (non-US lane, or too heavy).
      *
+     * @param ShippingQuoteHeader $shippingQuote
+     *
+     * @return int|null
+     */
+    protected function getSurePostCode(ShippingQuoteHeader $shippingQuote): ?int
+    {
+        if ((strtoupper($shippingQuote->shipTo->countryCode) != 'US') || ($shippingQuote->shipFrom->countryCode != 'US')) {
+            return null;
+        }
+
+        $lbsConversion = UnitConversions::grams_to_pounds($shippingQuote->orderWeightWithPackagingInGrams);
+
+        if ($lbsConversion <= 1) {
+            return 92;
+        }
+
+        if ($lbsConversion >= 1 && $lbsConversion <= 10) {
+            return 93;
+        }
+
+        return null;
+    }
+
+    /**
+     * buildRateRequests
+     * Adds UPS's rate request(s) - the main transit-enabled quote, plus an
+     * optional SurePost quote for lightweight US-to-US shipments - to the
+     * given HTTP connection pool so they run genuinely concurrently with
+     * each other AND every other carrier's requests via curl_multi, instead
+     * of blocking the whole process in turn one at a time. Laravel's Http
+     * client is synchronous, so wrapping it in an Amp fiber alone does NOT
+     * make it non-blocking.
+     *
+     * @param Pool $pool
      * @param ShippingQuoteHeader $shippingQuote
      *
      * @return array
      */
-    public function getRatesAlmostAll(ShippingQuoteHeader $shippingQuote): array
+    public function buildRateRequests(Pool $pool, ShippingQuoteHeader $shippingQuote): array
     {
         $token = $this->getAccessToken();
 
@@ -227,139 +312,106 @@ class UPS implements IApiProvider
             throw new \Exception('No UPS token');
         }
 
-        $payload = [
-            "RateRequest" => [
-                "Request" => [
-                    "TransactionReference" => [
-                        "CustomerContext" => "CustomerContext"
-                    ]
-                ],
-                "Shipment" => [
-                    "Shipper" => [
-                        "Name" => "ShipperName",
-                        "ShipperNumber" => env('UPS_SHIPPER_NUMBER'),
-                        "Address" => [
-                            "AddressLine" => [
-                                $shippingQuote->shipFrom->address1
-                            ],
-                            "City" => $shippingQuote->shipFrom->city,
-                            "StateProvinceCode" => $shippingQuote->shipFrom->stateOrProvince,
-                            "PostalCode" => $shippingQuote->shipFrom->postalCode,
-                            "CountryCode" => $shippingQuote->shipFrom->countryCode
-                        ]
-                    ],
-                    "ShipTo" => [
-                        "Name" => "ShipToName",
-                        "Address" => [
-                            "AddressLine" => [
-                                $shippingQuote->shipTo->address1
-                            ],
-                            "City" => $shippingQuote->shipTo->city,
-                            "StateProvinceCode" => $shippingQuote->shipTo->stateOrProvince,
-                            "PostalCode" => $shippingQuote->shipTo->postalCode,
-                            "CountryCode" => $shippingQuote->shipTo->countryCode
-                        ]
-                    ],
-                    "ShipFrom" => [
-                        "Name" => "ShipperName",
-                        "Address" => [
-                            "AddressLine" => [
-                                $shippingQuote->shipFrom->address1
-                            ],
-                            "City" => $shippingQuote->shipFrom->city,
-                            "StateProvinceCode" => $shippingQuote->shipFrom->stateOrProvince,
-                            "PostalCode" => $shippingQuote->shipFrom->postalCode,
-                            "CountryCode" => $shippingQuote->shipFrom->countryCode
-                        ]
-                    ],
-                    "PaymentDetails" => [
-                        "ShipmentCharge" => [
-                            [
-                                "Type" => "01",
-                                "BillShipper" => [
-                                    "AccountNumber" => env("UPS_SHIPPER_NUMBER")
-                                ]
-                            ]
-                        ]
-                    ],
-                    "ShipmentRatingOptions" => [
-                        "NegotiatedRatesIndicator" => "Y"
-                    ],
-                    "NumOfPieces" => "1",
-                    "Package" => [
-                        "PackagingType" => [
-                            "Code" => "02",
-                            "Description" => "Packaging"
-                        ],
-                        "PackageWeight" => [
-                            "UnitOfMeasurement" => [
-                                "Code" => "LBS",
-                                "Description" => "Pounds"
-                            ],
-                            "Weight" => number_format(UnitConversions::grams_to_pounds($shippingQuote->orderWeightWithPackagingInGrams), 1, '.', '')
-                        ]
-                    ]
-                ]
-            ]
+        $useTransit = config('shipping.request_transit_times', true);
+        $mainPayload = $useTransit ? $this->buildTransitPayload($shippingQuote) : $this->buildRatePayload($shippingQuote);
+        $mainEndpoint = $useTransit ? 'Shoptimeintransit' : 'Shop';
+
+        $requests = [
+            'ups_main' => $pool->as('ups_main')
+                ->withUserAgent(env('HTTP_USERAGENT', 'GuzzleHttp/7'))
+                ->timeout(env('HTTP_TIMEOUT', 5))
+                ->connectTimeout(env('HTTP_CONNECT', 2))
+                ->withHeaders(['rs-request-id' => uniqid()])
+                ->withToken($token)
+                ->post(env('UPS_LIVE_URL') . '/api/rating/v2403/' . $mainEndpoint, $mainPayload)
         ];
 
-        //ask UPS for arrival estimates.
-        //
-        ///Shop returns prices only. /Shoptimeintransit returns the same prices
-        //plus a TimeInTransit block per service, but requires the
-        //DeliveryTimeInformation payload below. The old code called /Shop, so
-        //there were never any dates to read - which is why generateReply()
-        //fell back to a hardcoded window.
-        //
-        //this is the call that produces every rate at checkout, so a bad
-        //request here means NO shipping options at all. we therefore try the
-        //richer endpoint and quietly fall back to the original one on any
-        //failure: worst case we lose the estimates, never the rates.
-        $wantsTransit = config('shipping.request_transit_times', true);
+        $surePostCode = $this->getSurePostCode($shippingQuote);
 
-        if ($wantsTransit) {
-            $transitPayload = $payload;
-            $transitPayload['RateRequest']['Shipment']['DeliveryTimeInformation'] = [
-                //03 = non-document / package
-                "PackageBillType" => "03",
-                "Pickup" => [
-                    "Date" => now()->format('Ymd'),
-                    "Time" => now()->format('Hi')
-                ]
-            ];
+        if (!is_null($surePostCode)) {
+            $requests['ups_surepost'] = $pool->as('ups_surepost')
+                ->withUserAgent(env('HTTP_USERAGENT', 'GuzzleHttp/7'))
+                ->timeout(env('HTTP_TIMEOUT', 5))
+                ->connectTimeout(env('HTTP_CONNECT', 2))
+                ->withHeaders(['rs-request-id' => uniqid()])
+                ->withToken($token)
+                ->post(env('UPS_LIVE_URL') . '/api/rating/v2403/Rate', $this->buildSurePostPayload($shippingQuote, $surePostCode));
+        }
 
+        return $requests;
+    }
+
+    /**
+     * parseRatesResponses
+     * Validates the pooled responses and returns them in the same shape the
+     * old getRates() used to return. Throws only if the MAIN quote failed -
+     * that's the one used as the fallback trigger, matching the old
+     * behaviour where Shoptimeintransit failing fell back to Shop. SurePost
+     * has no fallback of its own (it never did) - if it failed, it simply
+     * contributes nothing.
+     *
+     * @param array $responses keyed the same way buildRateRequests() named them
+     *
+     * @return array
+     */
+    public function parseRatesResponses(array $responses): array
+    {
+        $mainResponse = $responses['ups_main'];
+
+        try {
+            $mainResponse->throw();
+        } catch (\Throwable $e) {
+            ApiRequestNote::newNote('error', 'UPS main rate request failed, falling back to Shop', [
+                'error' => $e->getMessage()
+            ]);
+            throw $e;
+        }
+
+        $rates = [$mainResponse->json()];
+
+        if (isset($responses['ups_surepost'])) {
             try {
-                $response = Http::withUserAgent(env('HTTP_USERAGENT', 'GuzzleHttp/7'))
-                    ->timeout(env('HTTP_TIMEOUT', 5))
-                    ->connectTimeout(env('HTTP_CONNECT', 2))
-                    ->withHeaders([
-                        'rs-request-id' => uniqid()
-                    ])
-                    ->withToken($token)
-                    ->post(env('UPS_LIVE_URL') . '/api/rating/v2403/Shoptimeintransit', $transitPayload);
-
-                $response->throw();
-
-                return $response->json();
+                $responses['ups_surepost']->throw();
+                $rates[] = $responses['ups_surepost']->json();
             } catch (\Throwable $e) {
-                ApiRequestNote::newNote('error','UPS Shoptimeintransit failed, falling back to Shop',[
+                ApiRequestNote::newNote('error', 'UPS SurePost request failed', [
                     'error' => $e->getMessage()
                 ]);
             }
         }
 
+        return $rates;
+    }
+
+    /**
+     * buildFallbackRates
+     * Blocking plain (/Shop, no transit data) rate request, used only when
+     * the pooled main quote failed. This is the rare path, so blocking here
+     * is an acceptable trade - resilience over speed. Does not retry
+     * SurePost, matching its pre-existing no-fallback behaviour.
+     *
+     * @param ShippingQuoteHeader $shippingQuote
+     *
+     * @return array
+     */
+    public function buildFallbackRates(ShippingQuoteHeader $shippingQuote): array
+    {
+        $token = $this->getAccessToken();
+
+        if (strlen($token) === 0) {
+            throw new \Exception('No UPS token');
+        }
+
         $response = Http::withUserAgent(env('HTTP_USERAGENT', 'GuzzleHttp/7'))
             ->timeout(env('HTTP_TIMEOUT', 5))
             ->connectTimeout(env('HTTP_CONNECT', 2))
-            ->withHeaders([
-                'rs-request-id' => uniqid()
-            ])
+            ->withHeaders(['rs-request-id' => uniqid()])
             ->withToken($token)
-            ->post(env('UPS_LIVE_URL') . '/api/rating/v2403/Shop', $payload);
+            ->post(env('UPS_LIVE_URL') . '/api/rating/v2403/Shop', $this->buildRatePayload($shippingQuote));
 
         $response->throw();
 
-        return $response->json();
+        return [$response->json()];
     }
 
     /**

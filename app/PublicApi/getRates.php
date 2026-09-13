@@ -23,8 +23,10 @@ use App\RemoteStores\IRemoteStore;
 use App\RemoteStores\Shopify;
 use Exception;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Http\Client\Pool;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\App;
+use Illuminate\Support\Facades\Http;
 use Ubench;
 use function Amp\async;
 
@@ -117,8 +119,37 @@ class getRates
 
         //start the benchmark
         $ubench->start();
-        //gather our promises
-        $promises = $this->getPromises();
+
+        //fetch every enabled carrier's rates concurrently via a single HTTP
+        //connection pool (curl_multi) - genuine concurrency, unlike the
+        //previous Amp-fiber-per-carrier approach, which looked parallel but
+        //actually ran sequentially because Laravel's Http client blocks on
+        //I/O and never yields control back to Revolt's event loop. That
+        //meant total latency was the SUM of every carrier's response time
+        //instead of the max - routinely blowing past Shopify's 3-10s
+        //carrier-service timeout (see fetchRatesForCarriers()).
+        $ratesByCarrier = $this->fetchRatesForCarriers($this->getEnabledCarriers(), $shippingQuote);
+
+        //build a DB-write/markup promise per carrier that actually returned
+        //rates - this part is local/DB-bound, not network-bound, so it
+        //doesn't need genuine concurrency to be fast, but keeping it on
+        //Amp\Future preserves the existing per-carrier error isolation
+        //(one carrier's markup logic throwing doesn't take down another's).
+        $promises = [];
+        foreach ($this->getEnabledCarriers() as $carrier) {
+            if (!array_key_exists($carrier->name, $ratesByCarrier)) {
+                //this carrier failed both its primary and fallback attempt -
+                //already logged/emailed in fetchRatesForCarriers()
+                continue;
+            }
+
+            $promises[] = $this->buildPromise($carrier, $ratesByCarrier[$carrier->name]);
+        }
+
+        if (count($promises) === 0) {
+            throw new Exception('no carriers returned rates');
+        }
+
         $async = Future\awaitAll($promises,new TimeoutCancellation(10));
 
         //end the benchmark
@@ -371,61 +402,119 @@ class getRates
     }
 
     /**
-     * getPromises
-     * This will return the async promises. We use the enabled carriers
-     * to determine what API Provider we will use.
+     * fetchRatesForCarriers
+     * Fetches every enabled carrier's rates concurrently, via one HTTP
+     * connection pool (curl_multi), instead of one carrier at a time.
      *
-     * @return array
-     * @throws Exception
+     * Phase 1: ask each provider to add its best-effort request(s) to a
+     * shared pool, then fire them all at once and wait for every one to
+     * resolve - this is where the real concurrency comes from.
+     *
+     * Phase 2: for any provider whose primary attempt failed, fall back to
+     * its (rare, blocking) fallback request. A carrier that fails both is
+     * logged/emailed and simply omitted from the result - the request as a
+     * whole still succeeds with whichever carriers did return rates.
+     *
+     * @param Collection $enabledCarriers
+     * @param \App\Models\ShippingQuoteHeader $shippingQuote
+     *
+     * @return array keyed by carrier name => raw rates array (same shape
+     *               normalizeRates() expects)
      */
-    protected function getPromises(): array
+    protected function fetchRatesForCarriers(Collection $enabledCarriers, $shippingQuote): array
     {
-        //if we already have this in the IOC just return it
-        if (App::bound('promisesData')) {
-            return App::make('promisesData');
-        }
-
-        //get the enabled carriers
-        $enabledCarriers = $this->getEnabledCarriers();
-
-        //if we have no enabledCarriers throw an exception
-        if (count($enabledCarriers) === 0) {
-            throw new Exception('No enabledCarriers');
-        }
-
-        $enabledPromises = [];//placeholder
-
-        //foreach carrier kick off a promise
+        $providersByCarrier = []; //carrier name => IApiProvider instance
         foreach ($enabledCarriers as $carrier) {
-            $enabledPromises[] = $this->buildPromise($carrier);
+            $providersByCarrier[$carrier->name] = $this->promiseGetApiProvider($carrier->name);
         }
 
-        //if we have no enabledPromises throw an exception
-        if (count($enabledPromises) === 0) {
-            throw new Exception('no enabledPromises');
+        //poolKey => carrier name, so pooled responses (which come back keyed
+        //by request, not by carrier) can be routed back to the right provider
+        $requestOwner = [];
+
+        $poolStart = microtime(true);
+
+        $responses = Http::pool(function (Pool $pool) use ($providersByCarrier, $shippingQuote, &$requestOwner) {
+            $requests = [];
+
+            foreach ($providersByCarrier as $carrierName => $provider) {
+                try {
+                    $carrierRequests = $provider->buildRateRequests($pool, $shippingQuote);
+                } catch (\Throwable $e) {
+                    //token fetch or request-building failed before we could
+                    //even queue it for this carrier - nothing to add to the
+                    //pool, it will be picked up as failed in phase 2 below
+                    ApiRequestNote::newNote('error', 'failed to build rate request: ' . $carrierName, [
+                        'error' => $e->getMessage()
+                    ]);
+                    continue;
+                }
+
+                foreach ($carrierRequests as $key => $request) {
+                    $requestOwner[$key] = $carrierName;
+                    $requests[$key] = $request;
+                }
+            }
+
+            return $requests;
+        });
+
+        ApiRequestNote::newNote('debug', 'rate pool timing', [
+            'seconds' => round(microtime(true) - $poolStart, 2)
+        ]);
+
+        //group the pooled responses back by carrier
+        $responsesByCarrier = [];
+        foreach ($responses as $key => $response) {
+            $responsesByCarrier[$requestOwner[$key]][$key] = $response;
         }
 
-        //bind our promises to the IOC
-        App::instance('promisesData', $enabledPromises);
+        $ratesByCarrier = [];
 
-        //return our promises
-        return $enabledPromises;
+        foreach ($providersByCarrier as $carrierName => $provider) {
+            $carrierResponses = $responsesByCarrier[$carrierName] ?? [];
+
+            try {
+                if (count($carrierResponses) === 0) {
+                    throw new Exception('no pooled response for ' . $carrierName);
+                }
+
+                $ratesByCarrier[$carrierName] = $provider->parseRatesResponses($carrierResponses);
+                continue;
+            } catch (\Throwable $e) {
+                //primary attempt failed - try the (rare, blocking) fallback
+            }
+
+            try {
+                $ratesByCarrier[$carrierName] = $provider->buildFallbackRates($shippingQuote);
+            } catch (\Throwable $e2) {
+                SendApiError::sendErrorEmail($e2->getMessage());
+                ApiRequestNote::newNote('error', 'carrier fully failed: ' . $carrierName, [
+                    'error' => $e2->getMessage()
+                ]);
+            }
+        }
+
+        return $ratesByCarrier;
     }
 
     /**
      * buildPromise
      * This method is a workhorse. This method creates the
      * async promise. The async promise contains a ton
-     * of logic for querying api providers, validating the results,
-     * storing the results, and other provisioning features
+     * of logic for validating the already-fetched rates, storing the
+     * results, and other provisioning features. Fetching the rates
+     * themselves happens beforehand in fetchRatesForCarriers(), concurrently
+     * across every carrier - this method is purely local/DB-bound from here.
      *
      * @param Carrier $carrier
+     * @param array $rates raw rates already fetched for this carrier
      * @return Future
      */
-    protected function buildPromise(Carrier $carrier): Future
+    protected function buildPromise(Carrier $carrier, array $rates): Future
     {
         //create the async promise
-        return async(function () use ($carrier) {
+        return async(function () use ($carrier, $rates) {
             #ApiRequestNote::newNote('info', 'Starting Promise: ' . $carrier->name);
 
             //if we don't have a shipping quote throw an exception
@@ -443,21 +532,6 @@ class getRates
 
             //get the api provider (fedex, stamps.com, shipstation, ups, etc)
             $apiProvider = $this->promiseGetApiProvider($carrier->name);
-
-            //we want to get the rates from the api provider
-            //timed individually (not just the overall parallel block) so a
-            //slow carrier can be identified instead of only knowing the
-            //whole batch was slow - this is what actually eats into
-            //Shopify's carrier-service timeout budget (3-10s depending on
-            //the store's request volume)
-            $carrierStart = microtime(true);
-            try {
-                $rates = $apiProvider->getRates($shippingQuote);
-            } finally {
-                ApiRequestNote::newNote('debug', 'carrier timing: ' . $carrier->name, [
-                    'seconds' => round(microtime(true) - $carrierStart, 2)
-                ]);
-            }
 
             //if we have no rates throw an exception
             if (count($rates) === 0) {

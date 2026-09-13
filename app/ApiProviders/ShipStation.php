@@ -3,10 +3,12 @@
 namespace App\ApiProviders;
 
 use App\Libraries\UnitConversions;
+use App\Models\ApiRequestNote;
 use App\Models\ShippingQuoteHeader;
 use App\Models\ShippingQuoteService;
 use Exception;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Http\Client\Pool;
 use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\Http;
 
@@ -36,18 +38,15 @@ class ShipStation implements IApiProvider
     }
 
     /**
-     * getRates
-     * This method is responsible for calling the carrier api
-     * and returning the responses as an array (of decoded responses)
+     * buildRatePayload
      *
      * @param ShippingQuoteHeader $shippingQuote
      *
      * @return array
      */
-    public function getRates(ShippingQuoteHeader $shippingQuote): array
+    protected function buildRatePayload(ShippingQuoteHeader $shippingQuote): array
     {
-        // Prepare payload
-        $payload = [
+        return [
             'carrierCode' => 'stamps_com',
             'fromPostalCode' => $shippingQuote->shipFrom->postalCode,
             'fromCity' => $shippingQuote->shipFrom->city,
@@ -63,29 +62,75 @@ class ShipStation implements IApiProvider
             'confirmation' => 'delivery',
             'residential' => true,
         ];
+    }
 
-        $uspsResponse = Http::withUserAgent(env('HTTP_USERAGENT', 'GuzzleHttp/7'))
+    /**
+     * buildRateRequests
+     * Adds ShipStation's rate request to the given HTTP connection pool so
+     * it runs genuinely concurrently with every other carrier's requests
+     * via curl_multi, instead of blocking the whole process in turn.
+     * Laravel's Http client is synchronous, so wrapping it in an Amp fiber
+     * alone does NOT make it non-blocking.
+     *
+     * @param Pool $pool
+     * @param ShippingQuoteHeader $shippingQuote
+     *
+     * @return array
+     */
+    public function buildRateRequests(Pool $pool, ShippingQuoteHeader $shippingQuote): array
+    {
+        $request = $pool->as('usps')
+            ->withUserAgent(env('HTTP_USERAGENT', 'GuzzleHttp/7'))
             ->timeout(env('HTTP_TIMEOUT', 5))
             ->connectTimeout(env('HTTP_CONNECT', 2))
-            ->withHeaders([
-                'rs-request-id' => uniqid()
-            ])->withBasicAuth(env('USPS_API_KEY'), env('USPS_API_SECRET_KEY'));
+            ->withHeaders(['rs-request-id' => uniqid()])
+            ->withBasicAuth(env('USPS_API_KEY'), env('USPS_API_SECRET_KEY'));
 
         $partnerId = env('SHIPSTATION_PARTNER', '');
         if (strlen($partnerId) > 0) {
-            $uspsResponse = $uspsResponse->withHeaders([
+            $request = $request->withHeaders([
                 'x-partner' => $partnerId
             ]);
         }
 
-        $uspsResponse = $uspsResponse->post(env('USPS_LIVE_URL') . "/shipments/getrates", $payload);
-
-        // Throw an exception if a client or server error occurred...
-        $uspsResponse->throw();
-
         return [
-            $uspsResponse->json()
+            'usps' => $request->post(env('USPS_LIVE_URL') . "/shipments/getrates", $this->buildRatePayload($shippingQuote))
         ];
+    }
+
+    /**
+     * parseRatesResponses
+     * Validates the pooled response and returns it in the same shape the
+     * old getRates() used to return.
+     *
+     * @param array $responses keyed the same way buildRateRequests() named them
+     *
+     * @return array
+     */
+    public function parseRatesResponses(array $responses): array
+    {
+        $response = $responses['usps'];
+        $response->throw();
+
+        return [$response->json()];
+    }
+
+    /**
+     * buildFallbackRates
+     * ShipStation has no enhanced/plain distinction, so there is nothing
+     * meaningful to retry - a second attempt with an identical request is
+     * unlikely to succeed where the first didn't. This matches the old
+     * behaviour, which never retried USPS either.
+     *
+     * @param ShippingQuoteHeader $shippingQuote
+     *
+     * @return array
+     */
+    public function buildFallbackRates(ShippingQuoteHeader $shippingQuote): array
+    {
+        ApiRequestNote::newNote('error', 'ShipStation has no fallback rate request');
+
+        throw new Exception('ShipStation rate request failed and has no fallback');
     }
 
     /**
