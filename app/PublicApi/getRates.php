@@ -445,7 +445,19 @@ class getRates
             $apiProvider = $this->promiseGetApiProvider($carrier->name);
 
             //we want to get the rates from the api provider
-            $rates = $apiProvider->getRates($shippingQuote);
+            //timed individually (not just the overall parallel block) so a
+            //slow carrier can be identified instead of only knowing the
+            //whole batch was slow - this is what actually eats into
+            //Shopify's carrier-service timeout budget (3-10s depending on
+            //the store's request volume)
+            $carrierStart = microtime(true);
+            try {
+                $rates = $apiProvider->getRates($shippingQuote);
+            } finally {
+                ApiRequestNote::newNote('debug', 'carrier timing: ' . $carrier->name, [
+                    'seconds' => round(microtime(true) - $carrierStart, 2)
+                ]);
+            }
 
             //if we have no rates throw an exception
             if (count($rates) === 0) {
