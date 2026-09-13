@@ -155,6 +155,17 @@ class Fedex implements IApiProvider
             $transitBody = $body;
             $transitBody['requestedShipment']['shipDateStamp'] = now()->format('Y-m-d');
 
+            //EXPERIMENT: shipDateStamp alone never returns a "commit" block at
+            //all (confirmed against a live account - no commit key, not just
+            //empty fields). FedEx's own docs say returnTransitTimes is what
+            //actually triggers commit/transit data, even though a prior
+            //attempt at this field caused a 400 - re-testing here, wrapped in
+            //the same try/catch/fallback so a rejection just falls back to
+            //the plain rate call exactly like today, with the real FedEx
+            //error now logged via logFedexError() to confirm one way or the
+            //other.
+            $transitBody['requestedShipment']['returnTransitTimes'] = true;
+
             try {
                 $response = $this->postRateRequest($token, $transitBody);
                 $response->throw();
