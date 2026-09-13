@@ -99,25 +99,33 @@ class Shopify implements IRemoteStore
         $originAddress = $request->get('rate')['origin'];
 
         //get the destination address
+        //
+        //address1/city/stateOrProvince/postalCode/countryCode are all NOT
+        //NULL in the addresses table, but Shopify sends partial addresses
+        //(e.g. a cart-page rate estimator that only collects zip/province/
+        //country before checkout) with several of these as null - without
+        //these fallbacks the insert throws, the whole request 500s, and
+        //Shopify silently falls back to its own generic backup rate instead
+        //of ours.
         $address = App::make(Address::class);
-        $address->address1 = $destinationAddress['address1'];
+        $address->address1 = $destinationAddress['address1'] ?? '';
         $address->address2 = $destinationAddress['address2'];
         $address->address3 = $destinationAddress['address3'];
-        $address->city = $destinationAddress['city'];
-        $address->stateOrProvince = $destinationAddress['province'];
-        $address->postalCode = $destinationAddress['postal_code'];
-        $address->countryCode = $destinationAddress['country'];
+        $address->city = $destinationAddress['city'] ?? '';
+        $address->stateOrProvince = $destinationAddress['province'] ?? '';
+        $address->postalCode = $destinationAddress['postal_code'] ?? '';
+        $address->countryCode = $destinationAddress['country'] ?? '';
         $shipTo = Address::findOrCreateByFingerprint($address);
 
         //get the origin address
         $address = App::make(Address::class);
-        $address->address1 = $originAddress['address1'];
+        $address->address1 = $originAddress['address1'] ?? '';
         $address->address2 = $originAddress['address2'];
         $address->address3 = $originAddress['address3'];
-        $address->city = $originAddress['city'];
-        $address->stateOrProvince = $originAddress['province'];
-        $address->postalCode = $originAddress['postal_code'];
-        $address->countryCode = $originAddress['country'];
+        $address->city = $originAddress['city'] ?? '';
+        $address->stateOrProvince = $originAddress['province'] ?? '';
+        $address->postalCode = $originAddress['postal_code'] ?? '';
+        $address->countryCode = $originAddress['country'] ?? '';
         $shipFrom = Address::findOrCreateByFingerprint($address);
 
         $shipToName = $request->get('rate')['destination']['name'];
