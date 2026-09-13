@@ -10,6 +10,7 @@ use App\Support\TransitEstimate;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\App;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
@@ -38,14 +39,25 @@ class Fedex implements IApiProvider
         return 'fedex';
     }
 
+    /**
+     * getAccessToken
+     * Returns a cached FedEx OAuth token when we have a live one, otherwise
+     * fetches a new one and caches it. Shopify's carrier-service timeout is
+     * as low as 3-10 seconds depending on the store's request volume - an
+     * extra OAuth round trip on every single rate request eats directly into
+     * that budget for no reason, since these tokens are valid for a full
+     * hour.
+     *
+     * @return string
+     */
     protected function getAccessToken()
     {
-        /**
-         * getAccessToken
-         * This method is responsible for doing an oauth request and storing the token
-         * In a "perfect" world we would actually cache this token
-         * and use the cache for further entries (as long as the token was valid)
-         */
+        $cacheKey = 'fedex_access_token';
+
+        $cached = Cache::get($cacheKey);
+        if (!empty($cached)) {
+            return $cached;
+        }
 
         $response = Http::withUserAgent(env('HTTP_USERAGENT', 'GuzzleHttp/7'))
             ->timeout(env('HTTP_TIMEOUT', 5))
@@ -70,7 +82,16 @@ class Fedex implements IApiProvider
             throw $e;
         }
 
-        return $response->json('access_token', '');
+        $token = $response->json('access_token', '');
+
+        if (!empty($token)) {
+            //2 minute safety margin so we never hand out a token that's
+            //about to expire mid-request
+            $ttl = max(60, (int) $response->json('expires_in', 3600) - 120);
+            Cache::put($cacheKey, $token, $ttl);
+        }
+
+        return $token;
     }
 
     /**
