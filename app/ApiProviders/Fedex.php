@@ -132,19 +132,13 @@ class Fedex implements IApiProvider
         //--------------------------------------------------------------------
         // Delivery commitments (transit times)
         //
-        // FIX: the previous code set
-        //     $body['requestedShipment']['returnTransitTimes'] = true;
-        // That flag belongs to FedEx's LEGACY SOAP Web Services API. It is NOT
-        // a valid field on the REST Rate API (/rate/v1/rates/quotes) we call
-        // here, so FedEx rejected the ENTIRE request with
-        //   HTTP 400  "BAD.REQUEST.ERROR ... Missing or duplicate"
-        // which dropped FedEx out of every quote at checkout.
-        //
-        // The REST Rate & Transit Times API instead returns the commit /
-        // transitDays block automatically for eligible services once a planned
-        // ship date (shipDateStamp) is supplied. normalizeRates() ->
-        // applyDeliveryEstimate() already reads that block, so all we need to
-        // do is send a valid ship date.
+        // returnTransitTimes IS a valid REST field (confirmed against FedEx's
+        // own OpenAPI schema for this endpoint), but it lives under a
+        // TOP-LEVEL "rateRequestControlParameters" object - a sibling of
+        // requestedShipment, not a field inside it. Every previous attempt
+        // (including the one that got a 400 and the one that silently did
+        // nothing) put it in the wrong place. shipDateStamp stays inside
+        // requestedShipment as before.
         //
         // We build the transit-enabled request as a SEPARATE body and try it
         // first; if FedEx ever rejects it we fall back to the plain request so
@@ -154,17 +148,9 @@ class Fedex implements IApiProvider
         if (config('shipping.request_transit_times', true)) {
             $transitBody = $body;
             $transitBody['requestedShipment']['shipDateStamp'] = now()->format('Y-m-d');
-
-            //EXPERIMENT: shipDateStamp alone never returns a "commit" block at
-            //all (confirmed against a live account - no commit key, not just
-            //empty fields). FedEx's own docs say returnTransitTimes is what
-            //actually triggers commit/transit data, even though a prior
-            //attempt at this field caused a 400 - re-testing here, wrapped in
-            //the same try/catch/fallback so a rejection just falls back to
-            //the plain rate call exactly like today, with the real FedEx
-            //error now logged via logFedexError() to confirm one way or the
-            //other.
-            $transitBody['requestedShipment']['returnTransitTimes'] = true;
+            $transitBody['rateRequestControlParameters'] = [
+                'returnTransitTimes' => true
+            ];
 
             try {
                 $response = $this->postRateRequest($token, $transitBody);
@@ -277,11 +263,10 @@ class Fedex implements IApiProvider
      * is returned to Shopify without an estimate - which is valid, and far
      * better than inventing one.
      *
-     * The exact keys vary by API version and account configuration. If dates
-     * come back empty, dump a live response and check which of these paths is
-     * actually populated:
-     *
-     *   ApiRequestNote::newNote('debug','fedex reply',$reply);
+     * Field names verified against FedEx's own OpenAPI schema for this
+     * endpoint (developer.fedex.com/wirc/json/api_groups/Rate/RateQuotes-Resource.json).
+     * If dates still come back empty, the debug note below (still logged when
+     * every path misses) dumps the full reply for inspection.
      *
      * @param ShippingQuoteService $service
      * @param array $reply
@@ -291,9 +276,14 @@ class Fedex implements IApiProvider
     protected function applyDeliveryEstimate(ShippingQuoteService $service, array $reply): void
     {
         //1. a committed delivery timestamp, most precise.
-        //   commit.dateDetail.dayFormat is the REST field; the others are
-        //   fallbacks seen on some services / API versions.
+        //   commit.dateDetail.dayFormat and operationalDetail.commitDate are
+        //   both confirmed fields on FedEx's own OpenAPI schema for this
+        //   endpoint - commitDate in particular was the one field FedEx
+        //   populated on every service in their own reference example, even
+        //   when deliveryDate was empty. The rest are fallbacks seen on some
+        //   services / API versions.
         $committed = $reply['commit']['dateDetail']['dayFormat']
+            ?? $reply['operationalDetail']['commitDate']
             ?? $reply['commit']['derivedDeliveryDate']
             ?? $reply['operationalDetail']['deliveryDate']
             ?? $reply['operationalDetail']['deliveryDay']
