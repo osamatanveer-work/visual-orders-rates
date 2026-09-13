@@ -315,9 +315,10 @@ class Fedex implements IApiProvider
             return;
         }
 
-        //3. nothing usable - leave null and omit from the reply
-        ApiRequestNote::newNote('debug','fedex: no delivery estimate',[
-            'serviceType' => $reply['serviceType'] ?? null
-        ]);
+        //3. nothing usable - leave null and omit from the reply.
+        //   log the full reply (not just serviceType) so we can see exactly
+        //   what FedEx sent back and find the field this account/lane
+        //   actually populates.
+        ApiRequestNote::newNote('debug','fedex: no delivery estimate',$reply);
     }
 }
